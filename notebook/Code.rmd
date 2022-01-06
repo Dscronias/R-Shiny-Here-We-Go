@@ -1,0 +1,791 @@
+# R Shiny Here We Go
+
+I'm starting a new job in a few weeks and I need to get up to speed with R Shiny. Here goes.
+
+```{r, include = FALSE}
+# Libraries
+library(glue)
+library(janitor)
+library(knitr)
+library(readxl)
+library(tidyverse)
+library(utils)
+library(dtplyr)
+library(openxlsx)
+
+# Parameters
+url <- "http://open-data-assurance-maladie.ameli.fr/
+            depenses/download_file.php?file=Open_DAMIR/A201912.csv.gz"
+filename <- str_split(url, "/")[[1]] %>% last()
+filename_root <- str_split(filename, "\\.")[[1]][1]
+filename_extension <- str_split(filename, "\\.")[[1]][2]
+filename_compression <- str_split(filename, "\\.")[[1]][3]
+
+# Seed
+set.seed(451)
+
+#################################################
+# FUNCTIONS
+#################################################
+
+## ASSIGN_FACTOR_LABELS
+
+### 1) Transforms the column in df to a factor
+### 2) Retrieves the factor labels from Lexique_open-DAMIR
+### ! There are NAs in the PRS_NAT sheet, hence the drop_na()
+assign_factor_labels <- function(df, column) {
+    df %>%
+    mutate(
+        across(
+            column,
+            ~ .x %>% factor(
+                levels = read_xls(
+                    "../references/Lexique_open-DAMIR.xls",
+                    sheet = column
+                )[1] %>%
+                drop_na() %>%
+                as_vector(),
+                labels = read_xls(
+                    "../references/Lexique_open-DAMIR.xls",
+                    sheet = column
+                )[2] %>%
+                drop_na() %>%
+                modify(str_to_sentence) %>%
+                as_vector()
+            )
+        )
+    )
+}
+```
+
+## Downloading stuff
+
+There may be a Captcha. If there is indeed one, then download the file by hand. Sorry!
+
+The extraction takes forever. Do it by hand; programming this was actually a tremendous waste of my time.
+
+```{r, include = FALSE}
+# Download file
+# Unless it is already there, ofc
+if (file.exists(glue("../data/raw/{filename}"))) {
+    glue("File {filename} already exists")
+} else {
+    download.file(
+        url = url,
+        destfile = glue("../data/raw/{filename}")
+    )
+}
+
+# Extract
+if (file.exists(glue("../data/raw/{filename_root}.{filename_extension}"))) {
+    glue("File {filename_root}.{filename_extension} already exists")
+} else {
+    to_extract <- readr::read_csv(glue("../data/raw/{filename}"))
+    to_extract %>% readr::write_csv(
+        glue("../data/raw/{filename_root}.{filename_extension}")
+    )
+    rm(to_extract)
+    gc()
+}
+```
+
+This file is way too big: 35M rows and 56 variables. I'll take a random sample of 30K of them.
+
+```{r, include = FALSE}
+if (file.exists(glue("../data/raw/{filename_root}_sample.csv"))) {
+    print("There is already a sample file.")
+} else {
+    df <- readr::read_csv2(
+        glue("../data/raw/{filename_root}.{filename_extension}")
+    )
+    df %>%
+        slice_sample(n = 30000) %>%
+        readr::write_csv(
+            glue("../data/raw/{filename_root}_sample.csv")
+        )
+}
+
+```
+
+```{r, include = FALSE}
+# Importing df
+df <- readr::read_csv(
+        glue("../data/raw/{filename_root}_sample.csv")
+    ) %>%
+    select(-`...56`) # Why is this there?
+
+
+# Importing labels
+df_labels <-
+    read_xls(
+        "../references/Lexique_open-DAMIR.xls",
+        skip = 2
+    ) %>%
+    select(Variable...1, Libellé...2) %>%
+    rename(
+        variable = Variable...1,
+        label = Libellé...2
+    ) %>%
+    slice(-1)
+
+
+# List of factors in the df
+factors_list <- excel_sheets("../references/Lexique_open-DAMIR.xls") %>%
+    keep(~ any(colnames(df) %in% .x))
+
+# Transform categorical variables in the df to factors
+# Factor labels are retrieved from Lexique_open-DAMIR
+## I am ashamed of using a for loop, but I haven't found a way to elegantly
+## put this function in a mutate(across())
+for (var in factors_list) {
+    print(glue("Assigning values of factor {var}"))
+    df <- df %>%
+        assign_factor_labels(var)
+}
+
+# Add variable class to labels dataframe
+df_labels <- df_labels %>%
+    left_join(
+        bind_cols(
+            variable = df %>% colnames(),
+            class = df %>% sapply(class)
+        )
+    )
+
+saveRDS(df, "../data/final/A201912.RDS")
+saveRDS(df_labels, "../data/final/A201912_labels.RDS")
+```
+
+```{r}
+df
+df_labels %>% kable()
+```
+
+
+# One-way tables templates
+
+```{r}
+df %>%
+    select_if(is.factor) %>%
+    select(-PRS_NAT) %>%
+    sapply(tabyl) %>%
+    adorn_pct_formatting(digits = 2)
+```
+
+```{r}
+tabyl(df$AGE_BEN_SNDS) %>%
+    adorn_pct_formatting(digits = 2)
+```
+
+```{r}
+    df %>%
+    summarise(
+        N = n(),
+        Mean = mean(FLT_ACT_COG),
+        SD = sd(FLT_ACT_COG),
+        Minimum = min(FLT_ACT_COG),
+        `1%` = quantile(FLT_ACT_COG, 0.01),
+        `5%` = quantile(FLT_ACT_COG, 0.05),
+        `25%` = quantile(FLT_ACT_COG, 0.25),
+        `50%` = quantile(FLT_ACT_COG, 0.50),
+        `75%` = quantile(FLT_ACT_COG, 0.75),
+        `95%` = quantile(FLT_ACT_COG, 0.95),
+        `99%` = quantile(FLT_ACT_COG, 0.99),
+        Maximum = max(FLT_ACT_COG)
+    )
+```
+
+# Two-way tables templates
+
+```{r}
+varlist <- c("AGE_BEN_SNDS", "BEN_SEX_COD")
+for (var in varlist) {
+    table <- df %>%
+        tabyl(!!sym(var))
+    print(table)
+}
+```
+
+```{r}
+df %>%
+    tabyl(AGE_BEN_SNDS, BEN_SEX_COD) %>%
+    adorn_totals() %>%
+    adorn_percentages("row") %>%
+    adorn_pct_formatting(digits = 2) %>%
+    adorn_ns() %>%
+    as.tibble()
+```
+
+```{r}
+df_labels %>%
+    filter(variable == "AGE_BEN_SNDS") %>% 
+    pull(label)
+```
+
+```{r}
+df %>% 
+    filter(AGE_BEN_SNDS %in% c("70 - 79 ans")) %>%
+    mutate(AGE_BEN_SNDS = fct_drop(AGE_BEN_SNDS)) %>%
+    pull(AGE_BEN_SNDS) %>%
+    is.factor()
+```
+
+```{r}
+bind_rows(
+    df %>%
+        tabyl(AGE_BEN_SNDS) %>%
+        adorn_totals() %>%
+        slice_tail(),
+    df %>%
+        tabyl(AGE_BEN_SNDS)
+)
+```
+
+```{r}
+df %>%
+    group_by(BEN_SEX_COD) %>%
+    summarise(
+        N = n(),
+        Mean = mean(PRS_REM_MNT),
+        SD = sd(PRS_REM_MNT),
+        Minimum = min(PRS_REM_MNT),
+        `1%` = quantile(PRS_REM_MNT, 0.01),
+        `5%` = quantile(PRS_REM_MNT, 0.05),
+        `25%` = quantile(PRS_REM_MNT, 0.25),
+        `50%` = quantile(PRS_REM_MNT, 0.50),
+        `75%` = quantile(PRS_REM_MNT, 0.75),
+        `95%` = quantile(PRS_REM_MNT, 0.95),
+        `99%` = quantile(PRS_REM_MNT, 0.99),
+        Maximum = max(PRS_REM_MNT)
+    )
+```
+
+```{r}
+df %>% drop_na(PRS_REM_MNT, BEN_SEX_COD)
+```
+
+```{r}
+df %>%
+    tabyl(BEN_SEX_COD)
+```
+
+# Custom report dev
+
+```{r}
+
+# SETUP & STYLES
+wb <- createWorkbook("Sample Report")
+addWorksheet(wb, "Table 1")
+
+hs1 <- createStyle(
+    border = "Top"
+)
+bs1 <- createStyle(
+    border = "Bottom"
+)
+indent_style <- createStyle(
+    indent = 1
+)
+rounding = 2
+
+# Parameters
+colvar <- "BEN_SEX_COD"
+rowvars <- c("AGE_BEN_SNDS", "ATT_NAT")
+percentage_style <- "row"
+total_col <- TRUE
+pval_col <- FALSE
+
+# Counters
+row_counter <- 1
+
+# Column variable categories
+colvar_categories <- df %>% pull(colvar) %>% levels()
+
+
+
+###############################################################################
+# HEADER
+
+# Build header
+table_header <- df %>%
+    tabyl(!!sym(rowvars[1]), !!sym(colvar)) %>%
+    as.tibble() %>%
+    slice(0)
+# Total column
+if (total_col) {
+    table_header <- table_header %>%
+    mutate(Total = NA)
+}
+## % (N) in header
+header_legend <- rep(c("% (N)"), times = length(table_header)-1) %>%
+    t()
+# P-value in a column
+if (pval_col) {
+    table_header <- table_header %>%
+    mutate(`P-value` = NA)
+}
+## N & % of column variable
+colvar_count <- df %>%
+    tabyl(BEN_SEX_COD) %>%
+    {if (total_col) adorn_totals(.) else .} %>%
+    adorn_pct_formatting(2) %>%
+    mutate(n = paste0("(", as.character(n), ")")) %>%
+    unite("percent", percent:n, sep = (" ")) %>%
+    mutate(percent = str_remove(percent, "%")) %>%
+    pull(percent) %>%
+    as_tibble() %>%
+    rename(Total = value) %>%
+    t()
+
+## Write colvar name
+writeData(wb = wb, sheet = "Table 1", x = colvar, startCol = 2)
+addStyle(wb, "Table 1", cols = 1:length(table_header), rows = 1, style = hs1)
+mergeCells(wb, "Table 1", cols = (1:length(colvar_count)) + 1, rows = 1)
+row_counter <- row_counter + 1
+## Write colvar categories
+writeData(wb = wb, sheet = "Table 1", x = table_header, startRow = row_counter)
+## Remove variable name in header
+writeData(wb = wb, sheet = "Table 1", x = " ", startRow = row_counter)
+row_counter <- row_counter + 1
+## Add header legend: % (N)
+writeData(wb = wb, sheet = "Table 1", x = header_legend, startCol = 2,
+    startRow = row_counter, colNames = FALSE)
+addStyle(wb, "Table 1", cols = 1:length(table_header), style = bs1,
+    rows = row_counter)
+row_counter <- row_counter + 1
+## Add counts of col var
+writeData(wb = wb, sheet = "Table 1", x = colvar_count, startCol = 1,
+    startRow = row_counter, colNames = FALSE, rowNames = TRUE)
+row_counter <- row_counter + 1
+
+###############################################################################
+# TABLE CONTENT
+for (rowvar in rowvars) {
+    # Create table
+    table <- df %>%
+        tabyl(!!sym(rowvar), !!sym(colvar)) %>%
+        adorn_percentages(percentage_style) %>%
+        adorn_pct_formatting(digits = rounding) %>%
+        mutate(across(colvar_categories, ~ str_remove(.x, "%"))) %>%
+        as.tibble()
+
+    # Total column
+    if (total_col) {
+        table_col_total <- df %>%
+            tabyl(!!sym(rowvar)) %>%
+            adorn_pct_formatting(2) %>%
+            mutate(n = paste0("(", as.character(n), ")")) %>%
+            unite("percent", percent:n, sep = (" ")) %>%
+            mutate(percent = str_remove(percent, "%")) %>%
+            rename(Total = percent)
+
+        table <- table %>%
+            left_join(table_col_total)
+    }
+
+    # Table
+    ## Write variable name
+    writeData(wb = wb, sheet = "Table 1", x = rowvar,
+        startRow = row_counter)
+    row_counter <- row_counter + 1
+    ## Write content
+    writeData(wb, "Table 1", table, startRow = row_counter, colNames = FALSE)
+    ## Indent rowvar categories
+    addStyle(wb, "Table 1", cols = 1,
+        rows = row_counter:(row_counter + nrow(table) - 1), style = indent_style)
+    row_counter <- row_counter + nrow(table)
+}
+
+###############################################################################
+# FOOTER
+
+# Border to bottom of table
+addStyle(wb, "Table 1", cols = 1:length(table_header),
+    rows = row_counter-1, style = bs1, stack = TRUE)
+
+###############################################################################
+# WRITE TABLE
+openXL(wb)
+saveWorkbook(wb, "Test.xlsx", overwrite = TRUE)
+```
+
+```{r}
+# Functions
+
+ds_report <- function(data, workbook, worksheet, colvar, rowvars, rounding = 2,
+    percentage_style = "row", counts = FALSE,
+    separate_counts = FALSE, total_col = TRUE, pval_col = FALSE,
+    chi_cat_reject = FALSE, chi_cat_reject_threshold = 30, filename) {
+
+# Data: dataframe
+# workbook: name of the workbook (string)
+# worksheet: name of the worksheet (string)
+# colvar: name of column variable (string, max one)
+# rowvars: names of row variables (vector of strings)
+# rounding: number of digits for rounding
+# percentage_style: "row", "col" or "both" (= cell) percentages
+# counts: show counts in parenthesis
+# separate_counts: show counts in a new column
+# total_col: add a total column (bool)
+# pval_col: put the p-values in a new column instead of new rows (bool)
+# chi_cat_reject: Automatic drop of categories with low counts
+# chi_cat_reject_threshold: Threshold at which categories are dropped (default:  categories with n <= 30 are dropped)
+## Use a value >= to 1 to drop based on counts (n), or < 1 to drop based on percentages (e.g. 0.01)
+# filename: Name of excel file to export to
+
+    # SETUP & STYLES
+    wb <- createWorkbook(workbook)
+    addWorksheet(wb, worksheet)
+
+    hs1 <- createStyle(
+        border = "Top"
+    )
+    bs1 <- createStyle(
+        border = "Bottom"
+    )
+    indent_style <- createStyle(
+        indent = 1
+    )
+
+    # Counters
+    row_counter <- 1
+
+    # Column variable categories
+    colvar_categories <- data %>%
+        pull(colvar) %>%
+        levels()
+
+    # Subfunction
+    separate_results <- function(data, column) {
+        column_n <- paste0(column, "_N")
+        column_perc <- paste0(column, "_N")
+
+        data %>%
+            mutate(!!sym(column) := str_remove(!!sym(column), "\\)")) %>%
+            separate(
+                !!sym(column),
+                c(paste0(column, "_N"), paste0(column, "_%")),
+                sep = "\\("
+            ) %>%
+            mutate(!!sym(column_n) := str_trim(!!sym(column_n)))
+    }
+
+    ###########################################################################
+    # HEADER
+
+    # Build header
+    table_header <- data %>%
+        tabyl(!!sym(rowvars[1]), !!sym(colvar)) %>%
+        as.tibble() %>%
+        slice(0)
+    # Total column
+    if (total_col) {
+        table_header <- table_header %>%
+        mutate(Total = NA)
+    }
+    ## % (N) in header
+    if (counts & separate_counts) {
+        header_legend <- rep(c("%", "N"), times = length(table_header)-1) %>%
+            t()
+    } else {
+        header_legend <- rep(c("% (N)"), times = length(table_header)-1) %>%
+            t()
+    }
+    
+    # P-value in a column
+    if (pval_col) {
+        table_header <- table_header %>%
+        mutate(`P-value` = NA)
+    }
+    ## COLUMN VARIABLE TREATMENT
+    colvar_count <- data %>%
+        tabyl(!!sym(colvar))
+    ### FOR CHI-SQUARED TESTS
+    ### Used to filter some columns in the chi-squared tests
+    if (chi_cat_reject) {
+        colvar_cats_chi_reject <- colvar_count %>%
+        {if (chi_cat_reject_threshold >= 1)
+            filter(., n < chi_cat_reject_threshold) else
+            filter(., percent < chi_cat_reject_threshold)} %>%
+        pull(BEN_SEX_COD) %>%
+        as.vector()
+        message("Rejected column categories for chi-sq test: ", colvar_cats_chi_reject)
+    }
+    ### Get counts (N + %) of column variable
+    colvar_count <- colvar_count %>%
+        {if (total_col) adorn_totals(.) else .} %>%
+        adorn_pct_formatting(2) %>%
+        mutate(n = paste0("(", as.character(n), ")")) %>%
+        unite("percent", percent:n, sep = (" ")) %>%
+        mutate(percent = str_remove(percent, "%")) %>%
+        pull(percent) %>%
+        as_tibble() %>%
+        rename(Total = value) %>%
+        t()
+
+    if (counts & separate_counts) {
+        colvar_count <- colvar_count %>% as_tibble()
+        for (var in colnames(colvar_count)) {
+            colvar_count <- colvar_count %>% separate_results(var)
+        }
+        colvar_count <- colvar_count %>%
+            mutate(
+                rowname = "Total"
+            ) %>%
+            column_to_rownames("rowname")
+    }
+
+    ## Write colvar name
+    writeData(wb = wb, sheet = worksheet, x = colvar, startCol = 2)
+    addStyle(wb, worksheet, cols = 1:(length(colvar_count)+1),
+        rows = 1, style = hs1
+    )
+    mergeCells(wb, worksheet, cols = (1:length(colvar_count)) + 1, rows = 1)
+    row_counter <- row_counter + 1
+    ## Write colvar categories
+    writeData(wb = wb, sheet = worksheet, x = table_header,
+        startRow = row_counter
+    )
+    ## Remove variable name in header
+    writeData(wb = wb, sheet = worksheet, x = " ", startRow = row_counter)
+    
+    ### Alternative header if N and % are separated
+    if (counts & separate_counts) {
+        alt_header_column = 2
+        for (cat in colvar_categories) {
+            writeData(wb = wb, sheet = worksheet, x = cat, 
+                startRow = row_counter, startCol = alt_header_column)
+            mergeCells(wb, worksheet, cols = (alt_header_column:(alt_header_column+1)),
+                rows = row_counter)
+            alt_header_column <- alt_header_column + 2
+        }
+        if (total_col) {
+            writeData(wb = wb, sheet = worksheet, x = "Total", 
+                startRow = row_counter, startCol = alt_header_column)
+            mergeCells(wb, worksheet, cols = (alt_header_column:(alt_header_column+1)),
+                rows = row_counter)
+            alt_header_column <- alt_header_column + 2
+        }
+    }
+
+    row_counter <- row_counter + 1
+    ## Add header legend: % (N)
+    writeData(wb = wb, sheet = worksheet, x = header_legend, startCol = 2,
+        startRow = row_counter, colNames = FALSE)
+    addStyle(wb, worksheet, cols = 1:(length(colvar_count)+1), style = bs1,
+        rows = row_counter)
+    row_counter <- row_counter + 1
+    ## Add counts of col var
+    writeData(wb = wb, sheet = worksheet, x = colvar_count, startCol = 1,
+        startRow = row_counter, colNames = FALSE, rowNames = TRUE)
+    row_counter <- row_counter + 1
+
+    ###########################################################################
+    # TABLE CONTENT
+    for (rowvar in rowvars) {
+        # Create table
+        table <- data %>%
+            tabyl(!!sym(rowvar), !!sym(colvar)) %>%
+            adorn_percentages(percentage_style) %>%
+            adorn_pct_formatting(digits = rounding) %>%
+            {if (counts) adorn_ns(.) else .} %>%
+            mutate(across(colvar_categories, ~ str_remove(.x, "%"))) %>%
+            as.tibble()
+
+        # Total column
+        if (total_col) {
+            table_col_total <- data %>%
+                tabyl(!!sym(rowvar)) %>%
+                adorn_pct_formatting(2) %>%
+                mutate(n = paste0("(", as.character(n), ")")) %>%
+                unite("percent", percent:n, sep = (" ")) %>%
+                mutate(percent = str_remove(percent, "%")) %>%
+                rename(Total = percent)
+
+            table <- table %>%
+                left_join(table_col_total)
+
+        }
+        
+        # Separate counts & percentages
+        if (counts & separate_counts) {
+            for (var in colvar_categories) {
+                table <- table %>% separate_results(var)
+            }
+            if (total_col) {
+                table <- table %>% separate_results("Total")
+            }
+        }
+
+        # Calculate chisq test
+        table_chi <- data %>%
+            mutate(
+                # Tabyl shows unused categories
+                # These should not be used in the chisq test
+                !!sym(rowvar) := fct_drop(!!sym(rowvar))
+            ) %>%
+            tabyl(!!sym(rowvar), !!sym(colvar)) %>%
+            select(-colvar_cats_chi_reject, -!!sym(rowvar)) %>%
+            as_tibble()
+
+        chi_pval <- if (chisq.test(table_chi)$p.value < 0.001) {
+            "< 0.001"
+        } else if (chisq.test(table_chi)$p.value < 0.05) {
+            chisq.test(table_chi)$p.value %>% round(3)
+        } else {
+            chisq.test(table_chi)$p.value %>% round(2)
+        }
+
+        # Table
+        ## Write variable name
+        writeData(wb = wb, sheet = worksheet, x = rowvar,
+            startRow = row_counter
+        )
+        row_counter <- row_counter + 1
+        ## Write content
+        writeData(wb, worksheet, table, startRow = row_counter,
+            colNames = FALSE
+        )
+        ## Indent rowvar categories
+        addStyle(wb, worksheet, cols = 1,
+            rows = row_counter:(row_counter + nrow(table) - 1),
+            style = indent_style
+        )
+        row_counter <- row_counter + nrow(table)
+        ## Add p-value
+        writeData(wb, worksheet, "P-value", startRow = row_counter)
+        writeData(wb, worksheet, chi_pval, startRow = row_counter, startCol = 2)
+        addStyle(wb, worksheet, cols = 1,
+            rows = row_counter,
+            style = indent_style
+        )
+        row_counter <- row_counter + 1
+    }
+
+    ###########################################################################
+    # FOOTER
+
+    # Border to bottom of table
+    addStyle(wb, worksheet, cols = 1:(length(colvar_count)+1),
+        rows = row_counter-1, style = bs1, stack = TRUE)
+
+    ###########################################################################
+    # WRITE TABLE
+    openXL(wb)
+    saveWorkbook(wb, filename, overwrite = TRUE)
+}
+```
+
+```{r}
+# df_report <- df %>%
+#     filter(BEN_SEX_COD %in% c("Masculin", "Feminin")) %>%
+#     mutate(BEN_SEX_COD = fct_drop(BEN_SEX_COD))
+
+ds_report(
+    data = df_report,
+    workbook = "Sample report",
+    worksheet = "Table 1", 
+    colvar = "BEN_SEX_COD",
+    rowvars = c("AGE_BEN_SNDS", "ATT_NAT", "PRS_PDS_QCP"),
+    counts = FALSE,
+    separate_counts = FALSE,
+    total_col = TRUE,
+    pval_col = FALSE,
+    chi_cat_reject = TRUE,
+    chi_cat_reject_threshold = 30,
+    filename = "Test.xlsx"
+)
+```
+
+```{r}
+colvar_cats_chi_reject <- c("Inconnu ou personne morale sans civilite", "Valeur inconnue")
+rowvar <- "ATT_NAT"
+colvar <- "BEN_SEX_COD"
+total_col <- TRU
+percentage_style <- "row"
+rounding <- 2
+counts <- TRUE
+separate_counts <- TRUE
+
+
+colvar_count <- df %>%
+        tabyl(!!sym(colvar))
+colvar_count
+
+colvar_count %>%
+    {if (total_col) adorn_totals(.) else .} %>%
+    adorn_pct_formatting(2) %>%
+    mutate(percent = str_remove(percent, "%")) %>%
+    select(-!!sym(colvar))
+
+
+colvar_count <- colvar_count %>%
+        {if (total_col) adorn_totals(.) else .} %>%
+        adorn_pct_formatting(2) %>%
+        mutate(n = paste0("(", as.character(n), ")")) %>%
+        unite("percent", percent:n, sep = (" ")) %>%
+        mutate(percent = str_remove(percent, "%")) %>%
+        pull(percent) %>%
+        as_tibble() %>%
+        rename(Total = value) %>%
+        t()
+
+# SEPARATE TOTAL N AND %
+colvar_count <- colvar_count %>% as_tibble()
+for (var in colnames(colvar_count)) {
+    colvar_count <- colvar_count %>% separate_results(var)
+}
+colvar_count %>% mutate(
+    rowname = "Total"
+) %>% column_to_rownames("rowname")
+
+colvar_categories <- df %>%
+    pull(colvar) %>%
+    levels()
+
+table <- df %>%
+            tabyl(!!sym(rowvar), !!sym(colvar)) %>%
+            adorn_percentages(percentage_style) %>%
+            adorn_pct_formatting(digits = rounding) %>%
+            {if (counts) adorn_ns(.) else .} %>%
+            mutate(across(colvar_categories, ~ str_remove(.x, "%"))) %>%
+            as.tibble()
+
+        # Total column
+        if (total_col) {
+            table_col_total <- df %>%
+                tabyl(!!sym(rowvar)) %>%
+                adorn_pct_formatting(2) %>%
+                mutate(n = paste0("(", as.character(n), ")")) %>%
+                unite("percent", percent:n, sep = (" ")) %>%
+                mutate(percent = str_remove(percent, "%")) %>%
+                rename(Total = percent)
+
+            table <- table %>%
+                left_join(table_col_total)
+
+
+table_header <- df %>%
+        tabyl(!!sym(rowvar), !!sym(colvar)) %>%
+        as.tibble() %>%
+        slice(0)
+
+separate_results <- function(data, column) {
+    column_n <- paste0(column, "_N")
+    column_perc <- paste0(column, "_N")
+
+    data %>%
+        mutate(!!sym(column) := str_remove(!!sym(column), "\\)")) %>%
+        separate(
+            !!sym(column),
+            c(paste0(column, "_N"), paste0(column, "_%")),
+            sep = "\\("
+        ) %>%
+        mutate(!!sym(column_n) := str_trim(!!sym(column_n)))
+}
+
+for (var in colvar_categories) {
+    table <- table %>% separate_results(var)
+}
+
+```
